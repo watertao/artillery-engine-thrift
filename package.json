@@ -1,0 +1,39 @@
+{
+  "name": "artillery-engine-thrift",
+  "version": "0.0.1",
+  "description": "Artillery engine for Apache Thrift RPC load testing",
+  "main": "index.js",
+  "scripts": {},
+  "keywords": [
+    "artillery",
+    "engine",
+    "thrift",
+    "rpc",
+    "load-testing",
+    "performance",
+    "testing"
+  ],
+  "author": "Watertao <1059912278@qq.com>",
+  "license": "MPL-2.0",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/your-username/artillery-engine-thrift.git"
+  },
+  "bugs": {
+    "url": "https://github.com/your-username/artillery-engine-thrift/issues"
+  },
+  "homepage": "https://github.com/your-username/artillery-engine-thrift#readme",
+  "engines": {
+    "node": ">=14.0.0"
+  },
+  "files": [
+    "index.js",
+    "README.md"
+  ],
+  "devDependencies": {},
+  "dependencies": {
+    "async": "^3.2.4",
+    "debug": "^4.3.4",
+    "thrift": "^0.22.0"
+  }
+}
