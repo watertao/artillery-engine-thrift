@@ -17,12 +17,12 @@
   "license": "MPL-2.0",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/your-username/artillery-engine-thrift.git"
+    "url": "git+https://github.com/watertao/artillery-engine-thrift.git"
   },
   "bugs": {
-    "url": "https://github.com/your-username/artillery-engine-thrift/issues"
+    "url": "https://github.com/watertao/artillery-engine-thrift/issues"
   },
-  "homepage": "https://github.com/your-username/artillery-engine-thrift#readme",
+  "homepage": "https://github.com/watertao/artillery-engine-thrift",
   "engines": {
     "node": ">=14.0.0"
   },
