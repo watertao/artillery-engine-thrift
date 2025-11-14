@@ -12,14 +12,18 @@ const debug = require("debug")("engine:thrift");
  *       ServiceName:
  *         module: "./gen-nodejs/ServiceName.js"  # Path to generated Thrift service module
  *         qName: "com.example.ServiceName"       # Fully qualified service name
- *         host: "localhost"                      # Thrift server host
- *         port: 8080                             # Thrift server port
+ *         host: "localhost"                      # Thrift server host (optional, can be from target)
+ *         port: 8080                             # Thrift server port (optional, can be from target)
  *         transport: "TFramedTransport"          # Transport: TBufferedTransport, TFramedTransport
  *         protocol: "TBinaryProtocol"            # Protocol: TBinaryProtocol, TCompactProtocol, TJSONProtocol
  *         connectTimeout: 5000                   # Connection timeout in ms (default: 5000)
  *         timeout: 10000                         # Request timeout in ms (default: 10000)
  *         maxAttempts: 3                         # Max retry attempts (default: 3)
  *         retryMaxDelay: 1000                    # Max retry delay in ms (default: 1000)
+ *
+ * Note: If host/port are not specified in service config, they will be extracted from config.target
+ *       (only if target starts with "thrift://", e.g., target: "thrift://localhost:8080")
+ *       Service config values take precedence over target values.
  *
  * Scenario Step Example:
  * - thrift:
@@ -46,18 +50,26 @@ class ThriftEngine {
     this.ee = ee;
     this.helpers = helpers;
 
-    // Get target address
+    // Get target address and parse it
     this.target = script.config.target;
+    this.targetHost = null;
+    this.targetPort = null;
+    if (this.target) {
+      const parsed = this._parseTarget(this.target);
+      if (parsed) {
+        this.targetHost = parsed.host;
+        this.targetPort = parsed.port;
+        debug(
+          `Parsed target: ${this.target} -> host: ${this.targetHost}, port: ${this.targetPort}`
+        );
+      }
+    }
 
     // Get Thrift engine configuration
     this.engineConf = { ...script.config.engines?.thrift };
 
     // Validate configuration
     this._validateConfig();
-
-    // Connection pool and client cache
-    this.connections = new Map();
-    this.clients = new Map();
 
     // Load service definitions
     this.serviceClasses = {};
@@ -70,12 +82,12 @@ class ThriftEngine {
       requestCounts: new Map(),
       responseTimes: new Map(),
       errorCounts: new Map(),
-      startTime: Date.now()
+      startTime: Date.now(),
     };
 
     // Cleanup function - Artillery will call this when test ends
     this.ee.on("done", () => {
-      console.log("clean resources....")
+      console.log("clean resources....");
       this.cleanup();
     });
 
@@ -120,6 +132,44 @@ class ThriftEngine {
         return callback(err, context);
       });
     };
+  }
+
+  /**
+   * Parse target URL to extract host and port
+   * Only processes targets with "thrift://" prefix
+   * @param {string} target - Target URL string
+   * @returns {Object|null} Object with host and port, or null if parsing fails or not thrift:// prefix
+   */
+  _parseTarget(target) {
+    if (!target || typeof target !== "string") {
+      return null;
+    }
+
+    // Only parse if target starts with "thrift://"
+    if (!target.startsWith("thrift://")) {
+      debug(
+        `Target "${target}" does not start with "thrift://", skipping parsing`
+      );
+      return null;
+    }
+
+    try {
+      // Parse as URL
+      const url = new URL(target);
+
+      const host = url.hostname || url.host;
+      const port = url.port ? parseInt(url.port, 10) : null;
+
+      if (host && port && port > 0 && port <= 65535) {
+        return { host, port };
+      }
+
+      debug(`Failed to extract valid host/port from target "${target}"`);
+      return null;
+    } catch (err) {
+      debug(`Failed to parse target "${target}":`, err);
+      return null;
+    }
   }
 
   /**
@@ -171,17 +221,21 @@ class ThriftEngine {
       );
     }
 
-    if (!serviceConfig.host) {
-      errors.push(`Service "${serviceName}": "host" is required`);
+    // Host validation - can be from serviceConfig or target
+    const host = serviceConfig.host || this.targetHost;
+    if (!host) {
+      errors.push(
+        `Service "${serviceName}": "host" is required (not found in service config or target)`
+      );
     }
 
-    if (!serviceConfig.port) {
-      errors.push(`Service "${serviceName}": "port" is required`);
-    } else if (
-      typeof serviceConfig.port !== "number" ||
-      serviceConfig.port <= 0 ||
-      serviceConfig.port > 65535
-    ) {
+    // Port validation - can be from serviceConfig or target
+    const port = serviceConfig.port || this.targetPort;
+    if (!port) {
+      errors.push(
+        `Service "${serviceName}": "port" is required (not found in service config or target)`
+      );
+    } else if (typeof port !== "number" || port <= 0 || port > 65535) {
       errors.push(
         `Service "${serviceName}": "port" must be a valid port number (1-65535)`
       );
@@ -456,8 +510,11 @@ class ThriftEngine {
    * Execute Thrift call
    */
   async _executeThriftCall(spec, context, ee) {
-    // Get or create client
-    const client = await this._getOrCreateClient(spec.service, context);
+    // Create dedicated client connection
+    const { client, connection } = await this._getOrCreateClient(
+      spec.service,
+      context
+    );
 
     // Prepare arguments - supports template substitution
     const args = this._prepareArguments(spec.args, context);
@@ -473,6 +530,11 @@ class ThriftEngine {
     // Execute call
     return new Promise((resolve, reject) => {
       const callback = (err, result) => {
+        try {
+          connection.end();
+        } catch (closeErr) {
+          debug("Error closing connection:", closeErr);
+        }
         if (err) {
           reject(err);
         } else {
@@ -480,13 +542,22 @@ class ThriftEngine {
         }
       };
 
-      // Call method
-      method.apply(client, [...args, callback]);
+      try {
+        // Call method
+        method.apply(client, [...args, callback]);
+      } catch (err) {
+        try {
+          connection.end();
+        } catch (closeErr) {
+          debug("Error closing connection:", closeErr);
+        }
+        reject(err);
+      }
     });
   }
 
   /**
-   * Get or create Thrift client
+   * Create a dedicated Thrift client for each request
    */
   async _getOrCreateClient(serviceName, context) {
     const serviceConfig = this.engineConf.services[serviceName];
@@ -494,55 +565,49 @@ class ThriftEngine {
       throw new Error(`Service ${serviceName} not configured`);
     }
 
-    const key = `${serviceConfig.host}:${serviceConfig.port}:${serviceName}`;
+    // Get host and port - prefer serviceConfig, fallback to target
+    const host = serviceConfig.host || this.targetHost;
+    const port = serviceConfig.port || this.targetPort;
 
-    // Check cache
-    if (this.clients.has(key)) {
-      return this.clients.get(key);
+    if (!host || !port) {
+      throw new Error(
+        `Service ${serviceName}: host and port must be configured either in service config or target`
+      );
     }
 
     // Create new connection
     const transport = this.getTransport(serviceConfig.transport);
     const protocol = this.getProtocol(serviceConfig.protocol);
 
-    const connection = thrift.createConnection(
-      serviceConfig.host,
-      serviceConfig.port,
-      {
-        transport: transport,
-        protocol: protocol,
-        max_attempts: serviceConfig.maxAttempts || 3,
-        retry_max_delay: serviceConfig.retryMaxDelay || 1000,
-        connect_timeout: serviceConfig.connectTimeout || 5000,
-        timeout: serviceConfig.timeout || 10000,
-      }
-    );
+    const connection = thrift.createConnection(host, port, {
+      transport: transport,
+      protocol: protocol,
+      max_attempts: serviceConfig.maxAttempts || 3,
+      retry_max_delay: serviceConfig.retryMaxDelay || 1000,
+      connect_timeout: serviceConfig.connectTimeout || 5000,
+      timeout: serviceConfig.timeout || 10000,
+    });
 
     // Error handling
     connection.on("error", (err) => {
-      console.error(`Connection error for ${key}:`, err);
-      this.clients.delete(key);
-      this.connections.delete(key);
+      console.error(
+        `Connection error for ${host}:${port}:${serviceName}:`,
+        err
+      );
     });
-    
+
     // Create client
     const Service = this.serviceClasses[serviceName];
-    // const client = thrift.createClient(Service, connection);
-
     const multiplexer = new thrift.Multiplexer();
     const client = multiplexer.createClient(
-      this.engineConf.services[serviceName].qName, // Fully qualified name of BusinessService
-      Service, // Thrift interface
-      connection // Basic TCP connection created above
+      this.engineConf.services[serviceName].qName,
+      Service,
+      connection
     );
 
-    // Cache
-    this.connections.set(key, connection);
-    this.clients.set(key, client);
+    debug(`Created client for ${host}:${port}:${serviceName}`);
 
-    debug(`Created new client for ${key}`);
-
-    return client;
+    return { client, connection };
   }
 
   /**
@@ -674,19 +739,7 @@ class ThriftEngine {
    * Clean up resources
    */
   cleanup() {
-    debug("Cleaning up connections...");
-
-    for (const [key, connection] of this.connections) {
-      try {
-        connection.end();
-        debug(`Closed connection: ${key}`);
-      } catch (err) {
-        debug(`Error closing connection ${key}:`, err);
-      }
-    }
-
-    this.connections.clear();
-    this.clients.clear();
+    debug("Cleanup invoked - no persistent connections to close.");
   }
 }
 
